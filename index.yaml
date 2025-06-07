@@ -1,0 +1,28 @@
+apiVersion: v1
+entries:
+  web-viewer:
+  - annotations:
+      category: Monitoring
+    apiVersion: v2
+    appVersion: 0.3.0
+    created: "2025-06-07T14:19:18.380677313Z"
+    description: A Helm chart for Kubernetes Web Log Viewer
+    digest: 2521e504e86a6ff895887fa838ee94fdafd2e8419bfab4ace98e0d80f7e18744
+    home: https://github.com/jessegoodier/kube-web-log-viewer
+    icon: https://raw.githubusercontent.com/jessegoodier/kube-web-log-viewer/main/icon.png
+    keywords:
+    - kubernetes
+    - logs
+    - monitoring
+    - web
+    maintainers:
+    - email: 31039225+jessegoodier@users.noreply.github.com
+      name: Jesse Goodier
+    name: web-viewer
+    sources:
+    - https://github.com/jessegoodier/kube-web-log-viewer
+    type: application
+    urls:
+    - https://github.com/jessegoodier/kube-web-log-viewer/releases/download/v0.3.0/web-viewer-0.3.0.tgz
+    version: 0.3.0
+generated: "2025-06-07T14:19:18.379557388Z"
