@@ -5,10 +5,12 @@ import re
 import tempfile
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import wraps
 from html import escape
+from threading import Lock
 from typing import Any, Dict, List, Optional
 
 from flask import (
@@ -32,13 +34,51 @@ from log_archiver import get_log_dir_stats, start_log_cleanup_job, watch_pods_an
 
 # --- Flask App Setup ---
 app = Flask(__name__, static_folder=".", static_url_path="")  # Serve static files from current dir
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "logpilot-default-secret-key-change-in-production")
+
+# Global session storage for log continuity tracking
+# Format: {session_id: {pod_name/container: {last_timestamp: str, seen_line_ids: set}}}
+log_session_cache = {}
+log_session_cache_lock = Lock()  # Thread-safe access to session cache
 
 # --- Logging Configuration ---
-# Basic logging to see Flask and K8s client interactions
-logging.basicConfig(level=logging.INFO)
-# Quieter Kubernetes client library logging for routine calls, unless debugging.
-logging.getLogger("kubernetes").setLevel(logging.WARNING)
-logging.getLogger("urllib3").setLevel(logging.WARNING)
+# Configure logging based on environment variables
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+DEBUG_APP = os.environ.get("DEBUG_APP", "false").lower() == "true"
+DEBUG_KUBERNETES = os.environ.get("DEBUG_KUBERNETES", "false").lower() == "true"
+DEBUG_ARCHIVER = os.environ.get("DEBUG_ARCHIVER", "false").lower() == "true"
+
+# Map string level to logging constant
+log_level_map = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL
+}
+
+# Set up basic logging configuration
+basic_level = log_level_map.get(LOG_LEVEL, logging.INFO)
+if DEBUG_APP:
+    basic_level = logging.DEBUG
+
+logging.basicConfig(
+    level=basic_level,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+# Configure component-specific logging
+if DEBUG_KUBERNETES:
+    logging.getLogger("kubernetes").setLevel(logging.DEBUG)
+    logging.getLogger("urllib3").setLevel(logging.DEBUG)
+else:
+    # Quieter Kubernetes client library logging for routine calls
+    logging.getLogger("kubernetes").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+# Configure archiver logging
+if DEBUG_ARCHIVER:
+    logging.getLogger("log_archiver").setLevel(logging.DEBUG)
 
 
 # Add custom filter to prevent logging of /ready endpoint
@@ -461,8 +501,10 @@ def format_k8s_error(e):
                     "not found" in message.lower()
                     or "not ready" in message.lower()
                     or "containercreating" in message.lower()
+                    or "waiting to start" in message.lower()
+                    or "containerstarting" in message.lower()
                 ):
-                    return "Container is not ready yet", 400
+                    return "Container is not ready yet - waiting to start", 400
             except json.JSONDecodeError:
                 pass
         return f"Invalid request parameters: {error_message}", 400
@@ -520,8 +562,8 @@ def parse_log_line(line_str, strip_ansi=True):
     """
     Parses a log line that typically starts with an RFC3339Nano timestamp.
     Example: "2021-09-01T12:34:56.123456789Z This is the log message."
-    Returns a dictionary {'timestamp': str, 'message': str} or
-    {'timestamp': None, 'message': original_line} if no timestamp is parsed.
+    Returns a dictionary {'timestamp': str, 'message': str, 'line_id': str} or
+    {'timestamp': None, 'message': original_line, 'line_id': str} if no timestamp is parsed.
 
     Args:
         line_str: Raw log line string
@@ -535,11 +577,177 @@ def parse_log_line(line_str, strip_ansi=True):
         timestamp_str = match.group(1)
         message_str = match.group(3).strip()  # Get the message part and strip any trailing whitespace
         message_str = sanitize_log_message(message_str, strip_ansi=strip_ansi)
-        return {"timestamp": timestamp_str, "message": message_str}
+        # Create a unique line identifier for deduplication
+        line_id = f"{timestamp_str}:{hash(message_str) & 0x7FFFFFFF}"
+        return {"timestamp": timestamp_str, "message": message_str, "line_id": line_id}
     else:
         # If no timestamp is found at the beginning, return the whole line as the message.
         sanitized_line = sanitize_log_message(line_str.strip(), strip_ansi=strip_ansi)
-        return {"timestamp": None, "message": sanitized_line}
+        # Use current time and hash for lines without timestamps
+        from datetime import datetime, timezone
+
+        current_time = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        line_id = f"{current_time}:{hash(sanitized_line) & 0x7FFFFFFF}"
+        return {"timestamp": None, "message": sanitized_line, "line_id": line_id}
+
+
+def process_log_lines_with_deduplication(
+    raw_log_lines, pod_name, container_name, search_string=None, case_sensitive=False, seen_line_ids=None
+):
+    """
+    Process raw log lines with deduplication and search filtering.
+
+    Args:
+        raw_log_lines: List of raw log line strings
+        pod_name: Name of the pod
+        container_name: Name of the container
+        search_string: Optional search term to filter logs
+        case_sensitive: Whether search should be case sensitive
+        seen_line_ids: Set of already seen line IDs for deduplication
+
+    Returns:
+        tuple: (processed_logs, updated_seen_line_ids, latest_timestamp)
+    """
+    if seen_line_ids is None:
+        seen_line_ids = set()
+
+    processed_logs = []
+    latest_timestamp = None
+    duplicate_count = 0
+
+    # Enhanced logging for monitoring
+    container_key = f"{pod_name}/{container_name}"
+    app.logger.debug(f"Processing {len(raw_log_lines)} raw lines for {container_key}")
+
+    for line_str in raw_log_lines:
+        if not line_str:
+            continue
+
+        log_entry = parse_log_line(line_str)
+
+        # Skip duplicate lines
+        if log_entry["line_id"] in seen_line_ids:
+            duplicate_count += 1
+            app.logger.debug(f"Skipping duplicate line: {log_entry['line_id']}")
+            continue
+
+        # Apply search filter if provided
+        if search_string:
+            search_text = log_entry["message"] if case_sensitive else log_entry["message"].lower()
+            search_term = search_string if case_sensitive else search_string.lower()
+            if search_term not in search_text:
+                continue
+
+        # Add pod and container information
+        log_entry["pod_name"] = pod_name
+        log_entry["container_name"] = container_name
+
+        # Track the latest timestamp for continuity
+        if log_entry["timestamp"]:
+            latest_timestamp = log_entry["timestamp"]
+
+        processed_logs.append(log_entry)
+        seen_line_ids.add(log_entry["line_id"])
+
+    # Log processing statistics for monitoring
+    if duplicate_count > 0:
+        app.logger.info(
+            f"Processed {container_key}: {len(processed_logs)} new, {duplicate_count} duplicates, latest: {latest_timestamp}"
+        )
+    else:
+        app.logger.debug(f"Processed {container_key}: {len(processed_logs)} new logs, latest: {latest_timestamp}")
+
+    return processed_logs, seen_line_ids, latest_timestamp
+
+
+def get_session_log_state(session_id, container_key):
+    """
+    Thread-safe get log continuity state for a specific session and container.
+
+    Args:
+        session_id: Unique session identifier
+        container_key: Key identifying the container (format: pod_name/container_name)
+
+    Returns:
+        dict: {last_timestamp: str, seen_line_ids: set} or None if not found
+    """
+    with log_session_cache_lock:
+        if session_id not in log_session_cache:
+            log_session_cache[session_id] = {}
+
+        container_state = log_session_cache[session_id].get(container_key)
+        if container_state:
+            # Return a deep copy to avoid race conditions
+            return {
+                "last_timestamp": container_state["last_timestamp"],
+                "seen_line_ids": container_state["seen_line_ids"].copy(),
+                "updated_at": container_state["updated_at"],
+            }
+        return None
+
+
+def update_session_log_state(session_id, container_key, last_timestamp, seen_line_ids):
+    """
+    Thread-safe update of log continuity state for a specific session and container.
+
+    Args:
+        session_id: Unique session identifier
+        container_key: Key identifying the container
+        last_timestamp: Latest timestamp seen
+        seen_line_ids: Set of line IDs that have been processed
+    """
+    with log_session_cache_lock:
+        if session_id not in log_session_cache:
+            log_session_cache[session_id] = {}
+
+        log_session_cache[session_id][container_key] = {
+            "last_timestamp": last_timestamp,
+            "seen_line_ids": seen_line_ids.copy(),  # Make a copy to avoid reference issues
+            "updated_at": time.time(),
+        }
+
+        # Clean up old sessions (older than 1 hour) - but don't do it on every update
+        # to avoid overhead
+        if len(log_session_cache) > 100:  # Only cleanup when we have many sessions
+            cleanup_old_sessions_unsafe()  # Call unsafe version since we're already locked
+
+
+def cleanup_old_sessions_unsafe():
+    """Clean up session data older than 1 hour. Must be called with lock held."""
+    current_time = time.time()
+    sessions_to_remove = []
+
+    for session_id, session_data in log_session_cache.items():
+        # Check if all containers in this session are old
+        session_expired = True
+        for container_key, container_data in session_data.items():
+            if current_time - container_data.get("updated_at", 0) < 3600:  # 1 hour
+                session_expired = False
+                break
+
+        if session_expired:
+            sessions_to_remove.append(session_id)
+
+    for session_id in sessions_to_remove:
+        del log_session_cache[session_id]
+        app.logger.debug(f"Cleaned up expired session: {session_id}")
+
+
+def cleanup_old_sessions():
+    """Thread-safe cleanup of session data older than 1 hour to prevent memory leaks."""
+    with log_session_cache_lock:
+        cleanup_old_sessions_unsafe()
+
+
+def get_or_create_session_id():
+    """Get existing session ID or create a new one."""
+    if "log_session_id" not in session:
+        import uuid
+
+        session["log_session_id"] = str(uuid.uuid4())
+        app.logger.debug(f"Created new log session: {session['log_session_id']}")
+
+    return session["log_session_id"]
 
 
 # --- Routes ---
@@ -561,17 +769,41 @@ def _list_pods_with_retry():
 
 
 @retry_k8s_operation(max_retries=2, initial_delay=0.3)
-def _fetch_pod_logs_with_retry(pod_name, container_name=None, tail_lines=None):
-    """Helper function to fetch pod logs with retry logic."""
-    return v1.read_namespaced_pod_log(
-        name=pod_name,
-        namespace=KUBE_NAMESPACE,
-        container=container_name,
-        timestamps=True,
-        tail_lines=tail_lines,
-        follow=False,
-        _preload_content=True,
-    )
+def _fetch_pod_logs_with_retry(pod_name, container_name=None, tail_lines=None, since_seconds=None):
+    """
+    Helper function to fetch pod logs with retry logic and timestamp-based continuity.
+
+    Args:
+        pod_name: Name of the pod
+        container_name: Name of the container (optional)
+        tail_lines: Number of lines to fetch from the end (optional)
+        since_seconds: Number of seconds back to fetch logs from (optional)
+
+    Returns:
+        str: Raw log data from Kubernetes API
+    """
+    kwargs = {
+        "name": pod_name,
+        "namespace": KUBE_NAMESPACE,
+        "timestamps": True,
+        "follow": False,
+        "_preload_content": True,
+    }
+
+    if container_name:
+        kwargs["container"] = container_name
+
+    # Use since_seconds for temporal continuity, otherwise use tail_lines
+    if since_seconds is not None:
+        kwargs["since_seconds"] = since_seconds
+        app.logger.debug(f"Fetching logs for {pod_name}/{container_name or 'main'} since {since_seconds} seconds ago")
+    elif tail_lines is not None:
+        kwargs["tail_lines"] = tail_lines
+        app.logger.debug(f"Fetching last {tail_lines} lines for {pod_name}/{container_name or 'main'}")
+    else:
+        app.logger.debug(f"Fetching all logs for {pod_name}/{container_name or 'main'}")
+
+    return v1.read_namespaced_pod_log(**kwargs)
 
 
 @app.route("/api/pods", methods=["GET"])
@@ -696,24 +928,31 @@ def readiness_probe():
 @app.route("/api/logs", methods=["GET"])
 def get_logs():
     """
-    API endpoint to fetch logs for a specific pod/container or all pods.
+    Enhanced API endpoint to fetch logs with continuity tracking to prevent missing lines.
+
     Query Parameters:
         - pod_name (required): The name of the pod/container (format: 'pod' or 'pod/container') or 'all' for all pods.
         - sort_order (optional, default 'desc'): 'asc' (oldest first) or 'desc' (newest first).
-        - tail_lines (optional, default '100'): Number of lines to fetch. '0' means all lines. When searching, all logs are fetched first, then filtered by search term, then limited by tail_lines.
+        - tail_lines (optional, default '100'): Number of lines to fetch. '0' means all lines.
         - search_string (optional): String to filter log messages by.
         - case_sensitive (optional, default 'false'): 'true' for case-sensitive search, 'false' for case-insensitive.
-    Returns a JSON object with a list of log entries, each with 'timestamp', 'message', 'pod_name', and 'container_name'.
+        - reset_session (optional, default 'false'): 'true' to reset log continuity tracking for this session.
+
+    Returns a JSON object with a list of log entries, each with 'timestamp', 'message', 'pod_name', 'container_name', and 'line_id'.
     """
     global KUBE_NAMESPACE, v1
+
+    # Parse parameters
     pod_name_req = request.args.get("pod_name")
     sort_order = request.args.get("sort_order", "desc").lower()
     tail_lines_str = request.args.get("tail_lines", "100")
     search_string = request.args.get("search_string", "").strip()
     case_sensitive = request.args.get("case_sensitive", "false").lower() == "true"
+    reset_session = request.args.get("reset_session", "false").lower() == "true"
 
     app.logger.info(
-        f"Request for /api/logs: pod='{pod_name_req}', sort='{sort_order}', lines='{tail_lines_str}', search='{search_string}'"
+        f"Request for /api/logs: pod='{pod_name_req}', sort='{sort_order}', lines='{tail_lines_str}', "
+        f"search='{search_string}', reset_session={reset_session}"
     )
 
     if not pod_name_req:
@@ -727,147 +966,27 @@ def get_logs():
     except ValueError:
         return jsonify({"message": "Invalid number for tail_lines."}), 400
 
-    # When searching, fetch more logs to ensure we don't miss results
-    # If there's a search term, use a larger window or all logs
-    k8s_tail_lines = None if search_string else tail_lines
+    # Get or create session for continuity tracking
+    session_id = get_or_create_session_id()
+
+    # Reset session if requested
+    if reset_session and session_id in log_session_cache:
+        del log_session_cache[session_id]
+        app.logger.info(f"Reset log session: {session_id}")
 
     try:
         if pod_name_req == "all":
-            pod_list_response = v1.list_namespaced_pod(namespace=KUBE_NAMESPACE)
-            all_logs = []
-
-            for pod in pod_list_response.items:
-                if pod.metadata.name == KUBE_POD_NAME:
-                    continue
-
-                pod_name = pod.metadata.name
-
-                # Process init containers first
-                for init_container in pod.spec.init_containers or []:
-                    container_name = f"init-{init_container.name}"
-                    try:
-                        log_data_stream = _fetch_pod_logs_with_retry(
-                            pod_name=pod_name, container_name=init_container.name, tail_lines=k8s_tail_lines
-                        )
-                        raw_log_lines = log_data_stream.splitlines()
-                        for line_str in raw_log_lines:
-                            if not line_str:
-                                continue
-                            log_entry = parse_log_line(line_str)
-                            if search_string:
-                                search_text = log_entry["message"] if case_sensitive else log_entry["message"].lower()
-                                search_term = search_string if case_sensitive else search_string.lower()
-                                if search_term not in search_text:
-                                    continue
-                            log_entry["pod_name"] = pod_name
-                            log_entry["container_name"] = container_name
-                            all_logs.append(log_entry)
-                    except ApiException as e:
-                        app.logger.warning(
-                            f"Could not fetch logs for pod {pod_name} init container {init_container.name}: {e.status} - {e.reason}"
-                        )
-                        error_message, _ = format_k8s_error(e)
-                        error_entry = create_error_log_entry(
-                            pod_name=pod_name,
-                            container_name=container_name,
-                            error_message=error_message,
-                            error_type="log_fetch_error",
-                        )
-                        all_logs.append(error_entry)
-
-                # Process regular containers
-                for container in pod.spec.containers:
-                    container_name = container.name
-                    try:
-                        log_data_stream = _fetch_pod_logs_with_retry(
-                            pod_name=pod_name, container_name=container_name, tail_lines=k8s_tail_lines
-                        )
-                        raw_log_lines = log_data_stream.splitlines()
-                        for line_str in raw_log_lines:
-                            if not line_str:
-                                continue
-                            log_entry = parse_log_line(line_str)
-                            if search_string:
-                                search_text = log_entry["message"] if case_sensitive else log_entry["message"].lower()
-                                search_term = search_string if case_sensitive else search_string.lower()
-                                if search_term not in search_text:
-                                    continue
-                            log_entry["pod_name"] = pod_name
-                            log_entry["container_name"] = container_name
-                            all_logs.append(log_entry)
-                    except ApiException as e:
-                        app.logger.warning(
-                            f"Could not fetch logs for pod {pod_name} container {container_name}: {e.status} - {e.reason}"
-                        )
-                        error_message, _ = format_k8s_error(e)
-                        error_entry = create_error_log_entry(
-                            pod_name=pod_name,
-                            container_name=container_name,
-                            error_message=error_message,
-                            error_type="log_fetch_error",
-                        )
-                        all_logs.append(error_entry)
-
-            all_logs.sort(
-                key=lambda x: x.get("timestamp") or "0000-00-00T00:00:00Z",
-                reverse=(sort_order == "desc"),
+            # Fetch logs from all pods with session-based continuity
+            all_logs = fetch_all_pods_logs_with_continuity(
+                session_id, search_string, case_sensitive, tail_lines, sort_order
+            )
+        else:
+            # Fetch logs from specific pod/container with session-based continuity
+            all_logs = fetch_single_pod_logs_with_continuity(
+                session_id, pod_name_req, search_string, case_sensitive, tail_lines, sort_order
             )
 
-            if tail_lines is not None and tail_lines > 0:
-                if sort_order == "desc":
-                    all_logs = all_logs[:tail_lines]
-                else:
-                    all_logs = all_logs[-tail_lines:]
-
-            return jsonify({"logs": all_logs})
-        else:  # Single pod/container
-            # Split pod_name into pod and container if it contains a slash
-            pod_name = pod_name_req
-            container_name = None
-
-            if "/" in pod_name_req:
-                pod_name, container_name = pod_name_req.split("/", 1)
-                # Check if this is an init container (prefixed with "init-")
-                if container_name.startswith("init-"):
-                    # Remove the "init-" prefix to get the actual container name
-                    actual_container_name = container_name[5:]
-                else:
-                    actual_container_name = container_name
-            else:
-                actual_container_name = container_name
-
-            log_data_stream = _fetch_pod_logs_with_retry(
-                pod_name=pod_name, container_name=actual_container_name, tail_lines=k8s_tail_lines
-            )
-
-            raw_log_lines = log_data_stream.splitlines()
-            processed_logs = []
-            for line_str in raw_log_lines:
-                if not line_str:
-                    continue
-                log_entry = parse_log_line(line_str)
-                if search_string:
-                    search_text = log_entry["message"] if case_sensitive else log_entry["message"].lower()
-                    search_term = search_string if case_sensitive else search_string.lower()
-                    if search_term not in search_text:
-                        continue
-                log_entry["pod_name"] = pod_name
-                if container_name:
-                    log_entry["container_name"] = container_name
-                processed_logs.append(log_entry)
-
-            processed_logs.sort(
-                key=lambda x: x.get("timestamp") or "0000-00-00T00:00:00Z",
-                reverse=(sort_order == "desc"),
-            )
-
-            if tail_lines is not None and tail_lines > 0:
-                if sort_order == "desc":
-                    processed_logs = processed_logs[:tail_lines]
-                else:
-                    processed_logs = processed_logs[-tail_lines:]
-
-            return jsonify({"logs": processed_logs})
+        return jsonify({"logs": all_logs, "session_id": session_id})
 
     except ApiException as e:
         app.logger.error(
@@ -887,6 +1006,7 @@ def get_logs():
                             "message": f"[logPilot] {error_message}",
                             "error": False,
                             "error_type": "logpilot_info",
+                            "line_id": f"info:{hash(error_message) & 0x7FFFFFFF}",
                         }
                     ]
                 }
@@ -900,17 +1020,495 @@ def get_logs():
                 "pod_name": pod_name_req,
             }
         ), status_code
-    except Exception as e:
-        app.logger.error(
-            f"Unexpected error processing logs for '{pod_name_req}': {str(e)}",
-            exc_info=True,
+
+
+def fetch_container_logs_parallel(container_jobs):
+    """
+    Fetch logs from multiple containers in parallel to minimize timing skew.
+
+    Args:
+        container_jobs: List of tuples (session_id, container_key, pod_name, k8s_container_name,
+                       display_container_name, search_string, case_sensitive, is_init)
+
+    Returns:
+        List of all processed log entries from all containers
+    """
+    all_logs = []
+    max_workers = min(10, len(container_jobs))  # Limit concurrent connections
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all container log fetch jobs
+        future_to_container = {}
+        for job_args in container_jobs:
+            future = executor.submit(fetch_container_logs_with_continuity, *job_args)
+            future_to_container[future] = job_args[1]  # Store container_key for identification
+
+        # Collect results as they complete
+        for future in as_completed(future_to_container):
+            container_key = future_to_container[future]
+            try:
+                logs = future.result()
+                all_logs.extend(logs)
+                app.logger.debug(f"Successfully fetched {len(logs)} logs from {container_key}")
+            except ApiException as e:
+                # Extract container info from the job args
+                pod_name = container_key.split("/")[0]
+                container_name = container_key.split("/")[-1]
+                app.logger.warning(f"Could not fetch logs for {container_key}: {e.status} - {e.reason}")
+                error_message, _ = format_k8s_error(e)
+                error_entry = create_error_log_entry(
+                    pod_name=pod_name,
+                    container_name=container_name,
+                    error_message=error_message,
+                    error_type="log_fetch_error",
+                )
+                all_logs.append(error_entry)
+            except Exception as e:
+                # Handle other exceptions
+                pod_name = container_key.split("/")[0]
+                container_name = container_key.split("/")[-1]
+                app.logger.error(f"Unexpected error fetching logs from {container_key}: {str(e)}")
+                error_entry = create_error_log_entry(
+                    pod_name=pod_name,
+                    container_name=container_name,
+                    error_message=f"Unexpected error: {str(e)}",
+                    error_type="fetch_error",
+                )
+                all_logs.append(error_entry)
+
+    return all_logs
+
+
+def fetch_all_pods_logs_with_continuity(session_id, search_string, case_sensitive, tail_lines, sort_order):
+    """
+    Fetch logs from all pods with session-based continuity tracking and parallel fetching.
+
+    Args:
+        session_id: Session ID for continuity tracking
+        search_string: Search term to filter logs
+        case_sensitive: Whether search should be case sensitive
+        tail_lines: Number of lines to return (after processing)
+        sort_order: 'asc' or 'desc'
+
+    Returns:
+        List of processed log entries
+    """
+    pod_list_response = v1.list_namespaced_pod(namespace=KUBE_NAMESPACE)
+
+    # Build list of container jobs for parallel execution
+    container_jobs = []
+
+    for pod in pod_list_response.items:
+        if pod.metadata.name == KUBE_POD_NAME:
+            continue
+
+        pod_name = pod.metadata.name
+
+        # Add init containers to job queue
+        for init_container in pod.spec.init_containers or []:
+            container_name = f"init-{init_container.name}"
+            container_key = f"{pod_name}/{container_name}"
+            container_jobs.append(
+                (
+                    session_id,
+                    container_key,
+                    pod_name,
+                    init_container.name,
+                    container_name,
+                    search_string,
+                    case_sensitive,
+                    True,
+                )
+            )
+
+        # Add regular containers to job queue
+        for container in pod.spec.containers:
+            container_name = container.name
+            container_key = f"{pod_name}/{container_name}"
+            container_jobs.append(
+                (
+                    session_id,
+                    container_key,
+                    pod_name,
+                    container_name,
+                    container_name,
+                    search_string,
+                    case_sensitive,
+                    False,
+                )
+            )
+
+    app.logger.debug(f"Fetching logs from {len(container_jobs)} containers in parallel")
+
+    # Fetch logs from all containers in parallel
+    all_logs = fetch_container_logs_parallel(container_jobs)
+
+    # Sort all logs by timestamp for consistency
+    all_logs.sort(
+        key=lambda x: x.get("timestamp") or "0000-00-00T00:00:00Z",
+        reverse=(sort_order == "desc"),
+    )
+
+    # Apply final tail limit
+    if tail_lines is not None and tail_lines > 0:
+        if sort_order == "desc":
+            all_logs = all_logs[:tail_lines]
+        else:
+            all_logs = all_logs[-tail_lines:]
+
+    return all_logs
+
+
+def fetch_single_pod_logs_with_continuity(
+    session_id, pod_name_req, search_string, case_sensitive, tail_lines, sort_order
+):
+    """
+    Fetch logs from a specific pod/container with session-based continuity tracking.
+
+    Args:
+        session_id: Session ID for continuity tracking
+        pod_name_req: Pod name or pod/container specification
+        search_string: Search term to filter logs
+        case_sensitive: Whether search should be case sensitive
+        tail_lines: Number of lines to return (after processing)
+        sort_order: 'asc' or 'desc'
+
+    Returns:
+        List of processed log entries
+    """
+    # Split pod_name into pod and container if it contains a slash
+    pod_name = pod_name_req
+    container_name = None
+    actual_container_name = None
+
+    if "/" in pod_name_req:
+        pod_name, container_name = pod_name_req.split("/", 1)
+        # Check if this is an init container (prefixed with "init-")
+        if container_name.startswith("init-"):
+            # Remove the "init-" prefix to get the actual container name
+            actual_container_name = container_name[5:]
+            is_init = True
+        else:
+            actual_container_name = container_name
+            is_init = False
+    else:
+        actual_container_name = None
+        is_init = False
+
+    container_key = pod_name_req  # Use the full request as the key
+
+    logs = fetch_container_logs_with_continuity(
+        session_id,
+        container_key,
+        pod_name,
+        actual_container_name,
+        container_name or pod_name,
+        search_string,
+        case_sensitive,
+        is_init,
+    )
+
+    # Sort logs by timestamp
+    logs.sort(
+        key=lambda x: x.get("timestamp") or "0000-00-00T00:00:00Z",
+        reverse=(sort_order == "desc"),
+    )
+
+    # Apply final tail limit
+    if tail_lines is not None and tail_lines > 0:
+        if sort_order == "desc":
+            logs = logs[:tail_lines]
+        else:
+            logs = logs[-tail_lines:]
+
+    return logs
+
+
+def fetch_container_logs_with_continuity(
+    session_id,
+    container_key,
+    pod_name,
+    k8s_container_name,
+    display_container_name,
+    search_string,
+    case_sensitive,
+    is_init,
+):
+    """
+    Fetch logs from a specific container with continuity tracking and improved search handling.
+
+    Args:
+        session_id: Session ID for continuity tracking
+        container_key: Unique key for this container in the session
+        pod_name: Name of the pod
+        k8s_container_name: Container name for Kubernetes API calls
+        display_container_name: Container name to display in logs
+        search_string: Search term to filter logs
+        case_sensitive: Whether search should be case sensitive
+        is_init: Whether this is an init container
+
+    Returns:
+        List of processed log entries
+    """
+    # Get session state for this container
+    session_state = get_session_log_state(session_id, container_key)
+
+    since_time = None
+    seen_line_ids = set()
+
+    if session_state:
+        since_time = session_state.get("last_timestamp")
+        seen_line_ids = session_state.get("seen_line_ids", set())
+        app.logger.debug(f"Using continuity for {container_key}: since={since_time}, seen_lines={len(seen_line_ids)}")
+
+    # Enhanced search handling: use different strategies based on whether we're searching
+    if search_string and not since_time:
+        # Initial search: fetch more logs to build up a search buffer
+        tail_lines = 500  # Larger initial buffer for searches
+        app.logger.debug(f"Initial search fetch for {container_key}: using {tail_lines} lines")
+    elif search_string and since_time:
+        # Continuing search: fetch since timestamp but don't apply search filter yet
+        tail_lines = None
+        app.logger.debug(f"Continuing search fetch for {container_key}: since {since_time}")
+    else:
+        # Regular fetch: use standard buffer size
+        tail_lines = 100 if not since_time else None
+
+    # Convert timestamp to seconds for Kubernetes API
+    since_seconds = None
+    if since_time:
+        try:
+            # Parse the timestamp and convert to seconds ago
+            from datetime import datetime, timezone
+            
+            # Try to parse ISO format timestamp
+            if since_time.endswith('Z'):
+                timestamp_str = since_time[:-1] + '+00:00'
+            else:
+                timestamp_str = since_time
+                
+            timestamp_dt = datetime.fromisoformat(timestamp_str)
+            if timestamp_dt.tzinfo is None:
+                timestamp_dt = timestamp_dt.replace(tzinfo=timezone.utc)
+            
+            current_time = datetime.now(timezone.utc)
+            time_diff = current_time - timestamp_dt
+            since_seconds = max(1, int(time_diff.total_seconds()))  # At least 1 second
+            
+            app.logger.debug(f"Converted timestamp {since_time} to {since_seconds} seconds ago")
+        except Exception as e:
+            app.logger.warning(f"Failed to parse timestamp {since_time}: {e}. Using tail_lines instead.")
+            since_seconds = None
+            tail_lines = 100  # Fallback to tail_lines
+
+    # Fetch logs with temporal continuity
+    log_data_stream = _fetch_pod_logs_with_retry(
+        pod_name=pod_name, container_name=k8s_container_name, since_seconds=since_seconds, tail_lines=tail_lines
+    )
+
+    raw_log_lines = log_data_stream.splitlines()
+
+    # Process logs with deduplication - always store all logs, filter later
+    all_processed_logs, updated_seen_line_ids, latest_timestamp = process_log_lines_with_deduplication(
+        raw_log_lines,
+        pod_name,
+        display_container_name,
+        None,
+        False,
+        seen_line_ids,  # No search filtering here
+    )
+
+    # Apply search filtering after processing if needed
+    if search_string:
+        filtered_logs = apply_search_filter(all_processed_logs, search_string, case_sensitive)
+        app.logger.debug(
+            f"Search filtering for {container_key}: {len(all_processed_logs)} -> {len(filtered_logs)} lines"
         )
+    else:
+        filtered_logs = all_processed_logs
+
+    # Update session state with ALL processed logs (not just filtered ones) for continuity
+    if latest_timestamp or all_processed_logs:
+        final_timestamp = latest_timestamp or (all_processed_logs[-1]["timestamp"] if all_processed_logs else None)
+        update_session_log_state(session_id, container_key, final_timestamp, updated_seen_line_ids)
+        app.logger.debug(
+            f"Updated session state for {container_key}: timestamp={final_timestamp}, total_lines={len(updated_seen_line_ids)}"
+        )
+
+    return filtered_logs
+
+
+def apply_search_filter(logs, search_string, case_sensitive):
+    """
+    Apply search filtering to a list of logs.
+
+    Args:
+        logs: List of log entries
+        search_string: Search term to filter by
+        case_sensitive: Whether search should be case sensitive
+
+    Returns:
+        List of filtered log entries
+    """
+    if not search_string:
+        return logs
+
+    filtered_logs = []
+    search_term = search_string if case_sensitive else search_string.lower()
+
+    for log_entry in logs:
+        if log_entry.get("error"):
+            # Always include error entries
+            filtered_logs.append(log_entry)
+            continue
+
+        message = log_entry.get("message", "")
+        search_text = message if case_sensitive else message.lower()
+
+        if search_term in search_text:
+            filtered_logs.append(log_entry)
+
+    return filtered_logs
+
+
+@app.route("/api/log_continuity_stats", methods=["GET"])
+@require_api_key
+def get_log_continuity_stats():
+    """
+    API endpoint to get statistics about log continuity tracking.
+    Useful for monitoring and debugging missed log issues.
+    """
+    try:
+        with log_session_cache_lock:
+            stats = {"total_sessions": len(log_session_cache), "total_containers_tracked": 0, "sessions": {}}
+
+            for session_id, session_data in log_session_cache.items():
+                session_stats = {"containers": len(session_data), "containers_detail": {}}
+
+                for container_key, container_data in session_data.items():
+                    session_stats["containers_detail"][container_key] = {
+                        "last_timestamp": container_data.get("last_timestamp"),
+                        "seen_lines_count": len(container_data.get("seen_line_ids", set())),
+                        "last_updated": container_data.get("updated_at"),
+                        "age_seconds": time.time() - container_data.get("updated_at", time.time()),
+                    }
+
+                stats["sessions"][session_id] = session_stats
+                stats["total_containers_tracked"] += len(session_data)
+
+            return jsonify(stats)
+
+    except Exception as e:
+        app.logger.error(f"Error getting log continuity stats: {str(e)}")
+        return jsonify({"error": "Failed to get continuity stats", "message": str(e)}), 500
+
+
+@app.route("/api/log_health_check", methods=["GET"])
+@require_api_key
+def log_health_check():
+    """
+    API endpoint to perform a comprehensive health check of the logging system.
+    Helps identify potential issues with log continuity.
+    """
+    try:
+        health_status = {
+            "overall_status": "healthy",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "checks": {},
+        }
+
+        # Check 1: Session cache health
+        with log_session_cache_lock:
+            session_count = len(log_session_cache)
+            container_count = sum(len(session_data) for session_data in log_session_cache.values())
+
+            health_status["checks"]["session_cache"] = {
+                "status": "healthy" if session_count < 50 else "warning",
+                "session_count": session_count,
+                "container_count": container_count,
+                "message": "Normal" if session_count < 50 else f"High session count: {session_count}",
+            }
+
+        # Check 2: Kubernetes API connectivity
+        try:
+            v1.list_namespaced_pod(namespace=KUBE_NAMESPACE, limit=1)
+            health_status["checks"]["kubernetes_api"] = {"status": "healthy", "message": "Kubernetes API accessible"}
+        except Exception as e:
+            health_status["checks"]["kubernetes_api"] = {
+                "status": "error",
+                "message": f"Kubernetes API error: {str(e)}",
+            }
+            health_status["overall_status"] = "unhealthy"
+
+        # Check 3: Log archival system (if enabled)
+        try:
+            if RETAIN_ALL_POD_LOGS:
+                log_dir_stats = get_log_dir_stats()
+                if log_dir_stats["enabled"]:
+                    health_status["checks"]["log_archival"] = {
+                        "status": "healthy",
+                        "total_size_mb": log_dir_stats["total_size_mibytes"],
+                        "file_count": log_dir_stats["file_count"],
+                        "message": "Log archival active",
+                    }
+                else:
+                    health_status["checks"]["log_archival"] = {
+                        "status": "disabled",
+                        "message": "Log archival not enabled",
+                    }
+            else:
+                health_status["checks"]["log_archival"] = {
+                    "status": "disabled",
+                    "message": "RETAIN_ALL_POD_LOGS is false",
+                }
+        except Exception as e:
+            health_status["checks"]["log_archival"] = {
+                "status": "error",
+                "message": f"Log archival check failed: {str(e)}",
+            }
+
+        # Check 4: Memory usage estimation
+        try:
+            import psutil
+
+            process = psutil.Process()
+            memory_mb = process.memory_info().rss / 1024 / 1024
+
+            health_status["checks"]["memory_usage"] = {
+                "status": "healthy" if memory_mb < 500 else "warning" if memory_mb < 1000 else "error",
+                "memory_mb": round(memory_mb, 2),
+                "message": f"Memory usage: {memory_mb:.1f} MB",
+            }
+
+            if memory_mb >= 1000:
+                health_status["overall_status"] = "warning"
+        except ImportError:
+            health_status["checks"]["memory_usage"] = {
+                "status": "unknown",
+                "message": "psutil not available for memory monitoring",
+            }
+        except Exception as e:
+            health_status["checks"]["memory_usage"] = {"status": "error", "message": f"Memory check failed: {str(e)}"}
+
+        # Set overall status based on individual checks
+        error_checks = [check for check in health_status["checks"].values() if check["status"] == "error"]
+        warning_checks = [check for check in health_status["checks"].values() if check["status"] == "warning"]
+
+        if error_checks:
+            health_status["overall_status"] = "unhealthy"
+        elif warning_checks:
+            health_status["overall_status"] = "warning"
+
+        return jsonify(health_status)
+
+    except Exception as e:
+        app.logger.error(f"Error performing health check: {str(e)}")
         return jsonify(
             {
-                "message": "An unexpected error occurred while processing log request",
-                "error_type": "internal_error",
-                "retry_suggested": False,
-                "pod_name": pod_name_req,
+                "overall_status": "error",
+                "error": "Failed to perform health check",
+                "message": str(e),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         ), 500
 

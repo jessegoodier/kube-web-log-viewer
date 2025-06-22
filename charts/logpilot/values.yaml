@@ -15,6 +15,19 @@ previousPodLogs:
   # Allow purging of previous pod logs
   allowPurge: true
 
+# Logging configuration
+logging:
+  # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  level: "INFO"
+  # Enable debug logging for specific components
+  debug:
+    # Enable debug logging for the main application (detailed log processing info)
+    app: false
+    # Enable debug logging for Kubernetes client (API request/response details)
+    kubernetes: false
+    # Enable debug logging for log archival system (container startup states, etc.)
+    archiver: false
+
 # Storage configuration for all logs
 storage:
   # Storage type: "emptyDir" or "persistentVolume"

@@ -187,8 +187,11 @@
                         </div>
 
                         <div class="px-4 py-2 border-t border-gray-200 dark:border-gray-700">
-                            <button id="storageStatsButton" class="w-full py-2 px-3 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 dark:bg-indigo-500 dark:hover:bg-indigo-600">
+                            <button id="storageStatsButton" class="w-full py-2 px-3 mb-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 dark:bg-indigo-500 dark:hover:bg-indigo-600">
                                 Storage Stats
+                            </button>
+                            <button id="resetLogSessionButton" class="w-full py-2 px-3 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-orange-600 hover:bg-orange-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-orange-500 dark:bg-orange-500 dark:hover:bg-orange-600" title="Reset log continuity session to start fresh">
+                                Reset Log Session
                             </button>
                         </div>
 
@@ -315,6 +318,7 @@
             const logsToggle = document.getElementById('logsToggle');
             const eventsToggle = document.getElementById('eventsToggle');
             const selectorLabel = document.getElementById('selectorLabel');
+            const resetLogSessionButton = document.getElementById('resetLogSessionButton');
 
             // Hide/show elements based on view mode
             function updateUIElementsForViewMode() {
@@ -337,10 +341,85 @@
             let caseSensitive = localStorage.getItem('caseSensitive') === 'true';
             let highlightEnabled = localStorage.getItem('highlightEnabled') !== 'false'; // Default to true if not set
             let viewMode = localStorage.getItem('viewMode') || 'logs'; // 'logs' or 'events'
+            
+            // Enhanced log management with client-side buffering
+            let logSessionId = null;
+            let logBuffer = new Map(); // Key: container_key, Value: {logs: [], lastUpdate: timestamp}
+            let seenLineIds = new Set(); // Global set of seen line IDs for additional deduplication
 
             // Shared color mapping for consistent colors across logs and events
             let globalPodColorMap = new Map();
             let globalColorIndex = 0;
+            
+            // Enhanced log management functions
+            function resetLogSession() {
+                logSessionId = null;
+                logBuffer.clear();
+                seenLineIds.clear();
+                console.log('Log session reset');
+            }
+            
+            function addLogsToBuffer(containerKey, newLogs) {
+                if (!logBuffer.has(containerKey)) {
+                    logBuffer.set(containerKey, {logs: [], lastUpdate: Date.now()});
+                }
+                
+                const buffer = logBuffer.get(containerKey);
+                let addedCount = 0;
+                
+                for (const log of newLogs) {
+                    // Additional client-side deduplication
+                    if (!seenLineIds.has(log.line_id)) {
+                        buffer.logs.push(log);
+                        seenLineIds.add(log.line_id);
+                        addedCount++;
+                    }
+                }
+                
+                buffer.lastUpdate = Date.now();
+                console.log(`Added ${addedCount} new logs to buffer for ${containerKey}. Total: ${buffer.logs.length}`);
+                
+                // Clean up old buffer entries (keep last 1000 logs per container)
+                if (buffer.logs.length > 1000) {
+                    const removed = buffer.logs.splice(0, buffer.logs.length - 1000);
+                    console.log(`Removed ${removed.length} old logs from buffer for ${containerKey}`);
+                }
+                
+                return addedCount;
+            }
+            
+            function getBufferedLogs(containerKey = null) {
+                if (containerKey) {
+                    const buffer = logBuffer.get(containerKey);
+                    return buffer ? [...buffer.logs] : [];
+                }
+                
+                // Return all buffered logs from all containers
+                const allLogs = [];
+                for (const buffer of logBuffer.values()) {
+                    allLogs.push(...buffer.logs);
+                }
+                
+                // Sort by timestamp for consistency
+                allLogs.sort((a, b) => {
+                    const timeA = a.timestamp || '0000-00-00T00:00:00Z';
+                    const timeB = b.timestamp || '0000-00-00T00:00:00Z';
+                    return timeA.localeCompare(timeB);
+                });
+                
+                return allLogs;
+            }
+            
+            function clearLogBuffer(containerKey = null) {
+                if (containerKey) {
+                    logBuffer.delete(containerKey);
+                    console.log(`Cleared buffer for ${containerKey}`);
+                } else {
+                    logBuffer.clear();
+                    seenLineIds.clear();
+                    console.log('Cleared all log buffers');
+                }
+            }
 
             // Define pod colors - using a mix of colors that work well in both light and dark modes
             const podColors = [
@@ -466,6 +545,37 @@
                 settingsMenu.classList.add('hidden');
                 storageStatsModal.classList.remove('hidden');
                 updateStorageStats();
+            });
+
+            resetLogSessionButton.addEventListener('click', () => {
+                settingsMenu.classList.add('hidden');
+                if (confirm('Reset log session? This will clear all buffered logs and restart continuity tracking.')) {
+                    resetLogSession();
+                    // Trigger a fresh fetch with reset_session=true parameter
+                    const params = new URLSearchParams(window.location.search);
+                    const apiKey = params.get('api_key');
+                    
+                    const resetParams = new URLSearchParams({
+                        pod_name: podSelector.value || 'all',
+                        reset_session: 'true'
+                    });
+                    
+                    if (apiKey) {
+                        resetParams.set('api_key', apiKey);
+                    }
+                    
+                    fetchFromServer(`/api/logs?${resetParams.toString()}`)
+                        .then(data => {
+                            console.log('Session reset successful:', data);
+                            // Trigger a normal fetch to repopulate
+                            fetchAndDisplayData();
+                        })
+                        .catch(error => {
+                            console.error('Error resetting session:', error);
+                            // Still trigger normal fetch
+                            fetchAndDisplayData();
+                        });
+                }
             });
 
             closeStorageStats.addEventListener('click', () => {
@@ -1466,17 +1576,35 @@
                 const apiEndpoint = isArchivedLog ? '/api/archived_logs' : '/api/logs';
 
                 try {
-                    // Regular fetch for non-following mode (live or archived)
+                    // Enhanced fetch with session continuity and client-side buffering
                     console.log('Fetching logs with params:', params.toString());
                     const data = await fetchFromServer(`${apiEndpoint}?${params.toString()}`);
                     console.log('Received log data:', data);
+                    
                     if (!data.logs) {
                         console.error('No logs array in response:', data);
                         throw new Error('Invalid response format: missing logs array');
                     }
-                    currentLogs = data.logs;
+
+                    // Update session ID from server
+                    if (data.session_id) {
+                        logSessionId = data.session_id;
+                        console.log('Updated session ID:', logSessionId);
+                    }
+
+                    // Add new logs to buffer (with deduplication)
+                    const containerKey = actualPodName;
+                    const addedCount = addLogsToBuffer(containerKey, data.logs);
+                    
+                    // Get buffered logs for this container (or all if viewing "all")
+                    if (actualPodName === 'all') {
+                        currentLogs = getBufferedLogs(); // Get all buffered logs
+                    } else {
+                        currentLogs = getBufferedLogs(containerKey);
+                    }
+                    
                     currentEvents = []; // Clear events when viewing logs
-                    console.log('Setting currentLogs, length:', currentLogs.length);
+                    console.log(`Setting currentLogs, total length: ${currentLogs.length}, new logs: ${addedCount}`);
                     renderLogs();
                 } catch (error) {
                     console.error('Error in fetchAndDisplayLogs:', error);
@@ -1496,7 +1624,8 @@
                         error_type: error.errorType || 'unknown_error',
                         retry_suggested: error.retrySuggested !== false,
                         timestamp: null,
-                        pod_name: actualPodName || 'unknown'
+                        pod_name: actualPodName || 'unknown',
+                        line_id: `error:${Date.now()}:${Math.random()}`
                     };
 
                     currentLogs = [errorLogEntry];
